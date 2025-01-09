@@ -1,9 +1,14 @@
 import re
 import os
 import uuid
+import requests
 from datetime import datetime, timezone
 import xml.etree.ElementTree as elementTree
-import fitz
+import fitz  # PyMuPDF
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 
 def identify_hashes(text):
@@ -12,7 +17,7 @@ def identify_hashes(text):
 
     :param text: Текст, в котором нужно искать хэши.
     :type text: str
-    :return: Словарь, где ключи - типы хэшей, а значения - списки найденных хэшей данного типа.
+    :return: Словарь, где ключи - типы хэшей ('md5', 'sha1', 'sha256', 'sha512'), а значения - списки найденных хэшей данного типа.
     :rtype: dict
     """
     hash_patterns = {
@@ -58,6 +63,45 @@ def generate_ioc_id():
     return str(uuid.uuid4())
 
 
+def is_hash_malicious(hash_value):
+    """
+    Проверяет хэш на сайте Kaspersky OpenTip через API.
+
+    :param hash_value: Хэш для проверки.
+    :type hash_value: str
+    :return: True, если хэш безопасен (ответ 200), иначе False.
+    :rtype: bool
+    """
+    url = "https://opentip.kaspersky.com/ui/lookup"
+
+    # Заголовки запроса
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "ru,en;q=0.9",
+        "content-type": "application/octet-stream",
+        "cym9cgwjk": os.getenv("cym9cgwjk"),
+        "sec-ch-ua": "\"Chromium\";v=\"130\", \"YaBrowser\";v=\"24.12\", \"Not?A_Brand\";v=\"99\", \"Yowser\";v=\"2.5\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "x-kl-saas-ajax-request": "Ajax_Request",
+    }
+
+    # Тело запроса
+    payload = {
+        "query": hash_value,
+        "silent": False
+    }
+    try:
+        response = requests.post(url, json=payload, headers=headers)
+        return response.status_code == 200
+    except requests.RequestException as e:
+        print(f"Ошибка при проверке хэша {hash_value}: {e}")
+        return False
+
+
 def create_single_ioc_file(hashes, threat_name, output_dir):
     """
     Создает один IOC-файл для заданного набора хэшей.
@@ -80,18 +124,26 @@ def create_single_ioc_file(hashes, threat_name, output_dir):
     definition = elementTree.SubElement(ioc, 'definition')
     indicator = elementTree.SubElement(definition, 'Indicator', {'operator': 'OR'})
 
-    for hash_type, hash_list in hashes.items():
-        for hash_value in hash_list:
-            indicator_item = elementTree.SubElement(indicator, 'IndicatorItem', {'condition': 'is'})
-            elementTree.SubElement(indicator_item, 'Context', {
-                'document': 'FileItem',
-                'search': f'FileItem/{hash_type.upper()}'
-            })
-            content = elementTree.SubElement(indicator_item, 'Content', {'type': hash_type})
-            content.text = hash_value
+    # Файл для сохранения отфильтрованных хэшей
+    text_file_path = os.path.join(output_dir, f"{threat_name}_hashes.txt")
+    with open(text_file_path, 'a', encoding='utf-8') as text_file:
+        for hash_type, hash_list in hashes.items():
+            for hash_value in hash_list:
+                if not is_hash_malicious(hash_value):
+                    # Добавляем в IOC-файл
+                    indicator_item = elementTree.SubElement(indicator, 'IndicatorItem', {'condition': 'is'})
+                    elementTree.SubElement(indicator_item, 'Context', {
+                        'document': 'FileItem',
+                        'search': f'FileItem/{hash_type.upper()}'
+                    })
+                    content = elementTree.SubElement(indicator_item, 'Content', {'type': hash_type})
+                    content.text = hash_value
 
-    # Сохранение файла
-    output_path = os.path.join(output_dir, f"{threat_name}.ioc")
+                    # Сохраняем в текстовый файл
+                    text_file.write(f"{hash_type}: {hash_value}\n")
+
+    # Сохранение IOC-файла
+    output_path = os.path.join(output_dir, f"{threat_name}_{generate_ioc_id()}.ioc")
     tree = elementTree.ElementTree(ioc)
     try:
         tree.write(output_path, encoding='utf-8', xml_declaration=True)
